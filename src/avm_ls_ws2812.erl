@@ -36,11 +36,33 @@ build_stream(RGBIList) ->
 
 build_stream(RGBList, OrderFun) ->
     build_stream(RGBList, OrderFun, []).
-build_stream([{R, G, B, _I}|T], OrderFun, Acc) ->
-    LedN = led_strip_bytes(OrderFun({R, G, B})),
+build_stream([{R, G, B, I}|T], OrderFun, Acc) ->
+    {R1, G1, B1} = apply_brightness(R, G, B, I),
+    LedN = led_strip_bytes(OrderFun({R1, G1, B1})),
     build_stream(T, OrderFun, [LedN|Acc]);
 build_stream([], _, Acc) ->
     list_to_binary(lists:reverse(Acc)).
+
+apply_brightness(R, G, B, I) ->
+    Brightness = normalize_brightness(I, R, G, B),
+    case Brightness of
+        0 -> {0, 0, 0};
+        100 -> {R, G, B};
+        _ ->
+            %% Scale each channel using integer math to keep AtomVM compatible.
+            { (R * Brightness) div 100,
+              (G * Brightness) div 100,
+              (B * Brightness) div 100 }
+    end.
+
+normalize_brightness(I, _R, _G, _B) when I > 100 ->
+    100;
+normalize_brightness(I, _R, _G, _B) when I > 0 ->
+    I;
+normalize_brightness(_I, 0, 0, 0) ->
+    0;
+normalize_brightness(_I, _R, _G, _B) ->
+    100.
 
 %% 1 RGB LED will be 72 SPI bits <=> 9 bytes
 led_strip_bytes({C1, C2, C3}) ->
