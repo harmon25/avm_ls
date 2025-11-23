@@ -32,3 +32,4 @@ avm_ls-*.tar
 *.avm
 *.beam
 .vscode/**
+.elixir_ls/

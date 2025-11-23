@@ -76,7 +76,7 @@ start_link(Args) ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, Args, []).
 
 
--doc "Set the spedific LED colour. Index starts at 0".
+-doc "Set the spedific LED colour. Index starts at 1".
 -spec set_led(Index::non_neg_integer(), Colours::colours()) ->
           ok | {error, index_too_large}| no_return().
 set_led(Index, {rgb, {_R, _G, _B}} = C)      -> set_led1(Index, C);
