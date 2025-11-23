@@ -18,10 +18,10 @@ defmodule AvmLs do
     {_, _pid} = :avm_ls_server.start_link(start_args)
 
     Process.sleep(500)
-    color = {:rgbi, {255, 0, 0, 50}}
+    color = {:rgb, {0, 255, 0}}
 
     for i <- 1..strip_len do
-      # IO.puts("Setting #{i} to Red")
+      # IO.puts("Setting #{i} to green")
       :avm_ls_server.set_led(i, color)
     end
 
