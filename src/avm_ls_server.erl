@@ -77,7 +77,7 @@ start_link(Args) ->
 
 
 -doc "Set the spedific LED colour. Index starts at 1".
--spec set_led(Index::non_neg_integer(), Colours::colours()) ->
+-spec set_led(Index::pos_integer(), Colours::colours()) ->
           ok | {error, index_too_large}| no_return().
 set_led(Index, {rgb, {_R, _G, _B}} = C)      -> set_led1(Index, C);
 set_led(Index, {rgbi, {_R, _G, _B, _I}} = C) -> set_led1(Index, C);
@@ -87,7 +87,7 @@ set_led1(Index, C) ->
     gen_server:cast(?SERVER, {set_led, {Index, C}, self()}).
 
 -doc "Clear the spedific LED.".
--spec clear_led(Index::non_neg_integer()) -> ok | {error, index_too_large} | no_return().
+-spec clear_led(Index::pos_integer()) -> ok | {error, index_too_large} | no_return().
 clear_led(Index) ->
     gen_server:cast(?SERVER, {clear_led, Index, self()}).
 
@@ -128,9 +128,10 @@ init(Args) ->
     {reply, Reply :: term(), NewState :: term()}.
 handle_call({set_led, {Index, Colours}}, {Pid, _Tag},
             #{led_array := Arr, strip_len := Len, strip_index := SI} = State) ->
-    link(Pid),
     if
+        Index >= 1,
         Index =< Len ->
+            link(Pid),
             NewArr = update_array(Index, Arr, Pid, Colours),
             {reply, ok,
              State#{led_array := NewArr, strip_index := max(Index, SI)}};
@@ -140,8 +141,10 @@ handle_call({set_led, {Index, Colours}}, {Pid, _Tag},
 handle_call({clear_led, Index}, {Pid, _Tag},
             #{led_array := Arr, strip_len := Len, strip_index := SI} = State) ->
     if
+        Index >= 1,
         Index =< Len ->
-            NewArr = remove_pid_from_array(Index, Pid, Arr),
+            {NewArr, Removed} = remove_pid_from_array(Index, Pid, Arr),
+            maybe_unlink_pid(Removed, Pid, NewArr),
             {reply, ok,
              State#{led_array := NewArr, strip_index := max(Index, SI)}};
         true ->
@@ -156,9 +159,10 @@ handle_call(_, _, _) ->
     {stop, Reason :: term(), NewState :: term()}.
 handle_cast({set_led, {Index, Colours}, Pid},
             #{led_array := Arr, strip_len := Len, strip_index := SI} = State) ->
-    link(Pid),
     if
+        Index >= 1,
         Index =< Len ->
+            link(Pid),
             NewArr = update_array(Index, Arr, Pid, Colours),
             {noreply,
              State#{led_array := NewArr, strip_index := max(Index, SI)}};
@@ -168,8 +172,10 @@ handle_cast({set_led, {Index, Colours}, Pid},
 handle_cast({clear_led, Index, Pid},
             #{led_array := Arr, strip_len := Len, strip_index := SI} = State) ->
     if
+        Index >= 1,
         Index =< Len ->
-            NewArr = remove_pid_from_array(Index, Pid, Arr),
+            {NewArr, Removed} = remove_pid_from_array(Index, Pid, Arr),
+            maybe_unlink_pid(Removed, Pid, NewArr),
             {noreply,
              State#{led_array := NewArr, strip_index := max(Index, SI)}};
         true ->
@@ -217,27 +223,57 @@ update_array(Index, Array, Pid, Value) ->
 
 remove_pid_from_array(Index, Pid, Array) ->
     Map = maps:get(Index, Array),
-    NewMap = maps:remove(Pid, Map),
-    maps:put(Index, NewMap, Array).
+    case maps:is_key(Pid, Map) of
+        true ->
+            NewMap = maps:remove(Pid, Map),
+            {maps:put(Index, NewMap, Array), true};
+        false ->
+            {Array, false}
+    end.
 
-update_led_strip(#{led_array := Arr, cbm := CBM, spi := SPI, strip_index := SI, device_name := Name}
-                 = State) when SI > 0 ->
-    M1 = maps:filter(fun(Key, _Value) -> (Key =< SI) andalso (Key > 0) end,  Arr),
+maybe_unlink_pid(true, Pid, Array) ->
+    case pid_present(Pid, Array) of
+        true -> ok;
+        false -> unlink(Pid)
+    end;
+maybe_unlink_pid(false, _Pid, _Array) ->
+    ok.
 
-    F = fun(_Index, M) -> maps:fold(fun(_Pid, V, Acc) ->
-                                    sum_rgbi(V, Acc)
-                            end, {0,0,0,0}, M) end,
-    M2 = maps:map(F, M1),
-    M3 = maps:map(fun(_Index,{R,B,G,I}) ->
-                           {min(R, 255), min(B, 255), min(G, 255), min(I, 100)}
-                   end, M2),
-    %% io:format("M3 ~p~n", [M3]),
-    L3 = [ V || {_, V} <- lists:sort(maps:to_list(M3))], 
-    WriteData = CBM:build_stream(L3),
-    ok = spi:write(SPI, Name, #{write_data => WriteData}),
-    State#{strip_index := 0};
+pid_present(Pid, Array) ->
+    maps:fold(fun(_Index, Map, Acc) ->
+                      Acc orelse maps:is_key(Pid, Map)
+              end, false, Array).
+
+update_led_strip(#{led_array := Arr, cbm := CBM, spi := SPI,
+                   strip_index := SI, device_name := Name} = State)
+  when SI > 0 ->
+    Dirty = collect_dirty_leds(Arr, SI),
+    case Dirty of
+        [] ->
+            State#{strip_index := 0};
+        _ ->
+            Values = [V || {_, V} <- lists:sort(Dirty)],
+            WriteData = CBM:build_stream(Values),
+            ok = spi:write(SPI, Name, #{write_data => WriteData}),
+            State#{strip_index := 0}
+    end;
 update_led_strip(State) ->
     State.
+
+collect_dirty_leds(Arr, MaxIndex) ->
+    maps:fold(fun(Index, Map, Acc) when Index > 0, Index =< MaxIndex ->
+                      Sum = sum_led_entries(Map),
+                      [{Index, clamp_rgbi(Sum)} | Acc];
+                 (_, _, Acc) ->
+                      Acc
+              end, [], Arr).
+
+sum_led_entries(Map) ->
+    maps:fold(fun(_Pid, V, Acc) -> sum_rgbi(V, Acc) end,
+              {0, 0, 0, 0}, Map).
+
+clamp_rgbi({R, B, G, I}) ->
+    {min(R, 255), min(B, 255), min(G, 255), min(I, 100)}.
 
 sum_rgbi({rgbi, {R, B, G, I}}, {R0, B0, G0, I0}) ->
     {R + R0, B + B0, G + G0, I + I0};

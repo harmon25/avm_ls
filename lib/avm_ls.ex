@@ -17,8 +17,8 @@ defmodule AvmLs do
     start_args = %{di_pin: 32, strip_type: :ws2812, strip_len: strip_len}
     {_, _pid} = :avm_ls_server.start_link(start_args)
 
-    Process.sleep(500)
-    color = {:rgbi, {0, 255, 0, 25}}
+    # Process.sleep(500)
+    color = {:rgbi, {0, 220, 160, 10}}
 
     for i <- 1..strip_len do
       # IO.puts("Setting #{i} to green")
@@ -48,7 +48,7 @@ defmodule AvmLs do
   end
 
   defp clear_strip(led_count) do
-    for i <- 0..led_count do
+    for i <- 1..led_count do
       :avm_ls_server.set_led(i, {:rgb, {0, 0, 0}})
     end
   end
