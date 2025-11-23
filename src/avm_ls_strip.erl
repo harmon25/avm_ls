@@ -4,7 +4,7 @@ Behaviour for implementing SPI controlled LED strip types
 in callback modules. Callback modules are named `avm_ls_<strip_type>`.
 """.
 
--type strip_type() :: ws2812 | ap102 | sk9822 | atom().
+-type strip_type() :: ws2812 | ap102 | sk9822 | sk6812 | atom().
 -type rgbi() :: {avm_ls_server:col(), avm_ls_server:col(), avm_ls_server:col(),
                  avm_ls_server:ill()}.
 -type rgbi_list() :: [rgbi()].

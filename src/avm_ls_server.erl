@@ -39,12 +39,21 @@ The LED Strip gen_server module.
 -define(MOD_PRE_FIX, "avm_ls_").
 -define(SERVER, ?MODULE).
 -type col() :: 0..255.
+-type white() :: 0..255.
 -type ill() :: 0..100.
 
--doc "Different ways of setting the LED color and illumination".
+-doc "Different ways of setting the LED color, white channel, and illumination".
 -type colours() :: {rgb, {col(), col(), col()}} |
                    {rgbi, {col(), col(), col(), ill()}} |
+                   {rgbw, {col(), col(), col(), white()}} |
+                   {rgbwi, {col(), col(), col(), white(), ill()}} |
                    {hsv, {0..360, 0..100, ill()}}.
+
+-type led_components() :: #{r := non_neg_integer(),
+                           g := non_neg_integer(),
+                           b := non_neg_integer(),
+                           w := non_neg_integer(),
+                           i := non_neg_integer()}.
 
 -type strip_type() :: avm_ls_strip:strip_type().
 -type strip_len() :: non_neg_integer().
@@ -81,6 +90,8 @@ start_link(Args) ->
           ok | {error, index_too_large}| no_return().
 set_led(Index, {rgb, {_R, _G, _B}} = C)      -> set_led1(Index, C);
 set_led(Index, {rgbi, {_R, _G, _B, _I}} = C) -> set_led1(Index, C);
+set_led(Index, {rgbw, {_R, _G, _B, _W}} = C) -> set_led1(Index, C);
+set_led(Index, {rgbwi, {_R, _G, _B, _W, _I}} = C) -> set_led1(Index, C);
 set_led(Index, {hsv, {_H, _S, _V}} = C)      -> set_led1(Index, C).
 
 set_led1(Index, C) ->
@@ -151,7 +162,7 @@ handle_call({clear_led, Index}, {Pid, _Tag},
             {reply, {error, index_too_large}, State}
     end;
 handle_call(_, _, _) ->
-  error(not_implemented).
+    error(not_implemented).
 
 -spec handle_cast(Request :: term(), State :: term()) ->
     {noreply, NewState :: term()} |
@@ -252,7 +263,7 @@ update_led_strip(#{led_array := Arr, cbm := CBM, spi := SPI,
         [] ->
             State#{strip_index := 0};
         _ ->
-            Values = [V || {_, V} <- lists:sort(Dirty)],
+            Values = [format_led_value(Name, V) || {_, V} <- lists:sort(Dirty)],
             WriteData = CBM:build_stream(Values),
             ok = spi:write(SPI, Name, #{write_data => WriteData}),
             State#{strip_index := 0}
@@ -263,25 +274,53 @@ update_led_strip(State) ->
 collect_dirty_leds(Arr, MaxIndex) ->
     maps:fold(fun(Index, Map, Acc) when Index > 0, Index =< MaxIndex ->
                       Sum = sum_led_entries(Map),
-                      [{Index, clamp_rgbi(Sum)} | Acc];
+                      [{Index, clamp_components(Sum)} | Acc];
                  (_, _, Acc) ->
                       Acc
               end, [], Arr).
 
+-spec sum_led_entries(map()) -> led_components().
 sum_led_entries(Map) ->
-    maps:fold(fun(_Pid, V, Acc) -> sum_rgbi(V, Acc) end,
-              {0, 0, 0, 0}, Map).
+    maps:fold(fun(_Pid, V, Acc) -> sum_components(V, Acc) end,
+              empty_components(), Map).
 
-clamp_rgbi({R, B, G, I}) ->
-    {min(R, 255), min(B, 255), min(G, 255), min(I, 100)}.
+empty_components() ->
+    #{r => 0, g => 0, b => 0, w => 0, i => 0}.
 
-sum_rgbi({rgbi, {R, B, G, I}}, {R0, B0, G0, I0}) ->
-    {R + R0, B + B0, G + G0, I + I0};
-sum_rgbi({rgb, {R, B, G}}, {R0, B0, G0, I0}) ->
-    {R + R0, B + B0, G + G0, I0};
-sum_rgbi({hsv, {H, S, V}}, {R0, B0, G0, I0}) ->
-    {R,G,B} = write_dot_hsv({H, S, V}),
-    {R + R0, B + B0, G + G0, V + I0}.
+-spec clamp_components(led_components()) -> led_components().
+clamp_components(#{r := R, g := G, b := B, w := W, i := I} = Components) ->
+    Components#{r := min(R, 255),
+                g := min(G, 255),
+                b := min(B, 255),
+                w := min(W, 255),
+                i := min(I, 100)}.
+
+sum_components({rgb, {R, G, B}}, Acc) ->
+    Acc#{r := maps:get(r, Acc) + R,
+         g := maps:get(g, Acc) + G,
+         b := maps:get(b, Acc) + B};
+sum_components({rgbi, {R, G, B, I}}, Acc) ->
+    add_brightness(sum_components({rgb, {R, G, B}}, Acc), I);
+sum_components({rgbw, {R, G, B, W}}, Acc) ->
+    add_white(sum_components({rgb, {R, G, B}}, Acc), W);
+sum_components({rgbwi, {R, G, B, W, I}}, Acc) ->
+    add_brightness(sum_components({rgbw, {R, G, B, W}}, Acc), I);
+sum_components({hsv, {H, S, V}}, Acc) ->
+    {R, G, B} = write_dot_hsv({H, S, V}),
+    add_brightness(sum_components({rgb, {R, G, B}}, Acc), V);
+sum_components(_, Acc) ->
+    Acc.
+
+add_brightness(Acc, Value) ->
+    Acc#{i := maps:get(i, Acc) + Value}.
+
+add_white(Acc, Value) ->
+    Acc#{w := maps:get(w, Acc) + Value}.
+
+format_led_value(sk6812, #{r := R, g := G, b := B, w := W}) ->
+    {R, G, B, W};
+format_led_value(_, #{r := R, g := G, b := B, i := I}) ->
+    {R, G, B, I}.
 
 
 write_dot_hsv({H, S, V}) ->
