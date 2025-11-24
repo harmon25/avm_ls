@@ -27,7 +27,7 @@ The LED Strip gen_server module.
 -behaviour(gen_server).
 
 %% API
--export([start_link/1, set_led/2, clear_led/1, random/0]).
+-export([start_link/1, set_led/2, clear_led/1, fill/1, fill_async/1, random/0]).
 
 %%% gen_server callbacks
 -export([init/1]).
@@ -70,7 +70,8 @@ The LED Strip gen_server module.
                     strip_len := strip_len(),
                     strip_index := non_neg_integer(),
                     device_name := strip_type(),
-                    cbm := module()
+                    cbm := module(),
+                    flush_pending := boolean()
                   }.
 
 %%--------------------------------------------------------------------
@@ -102,6 +103,17 @@ set_led1(Index, C) ->
 clear_led(Index) ->
     gen_server:cast(?SERVER, {clear_led, Index, self()}).
 
+-doc "Set all LEDs to the same colour synchronously".
+-spec fill(Colours::colours()) -> ok.
+fill(Colours) ->
+    gen_server:call(?SERVER, {fill, Colours}).
+
+-doc "Set all LEDs to the same colour asynchronously".
+-spec fill_async(Colours::colours()) -> ok.
+fill_async(Colours) ->
+    gen_server:cast(?SERVER, {fill_async, Colours, self()}),
+    ok.
+
 random() -> atomvm:random().
 
 -spec init(Args::start_args()) -> state().
@@ -121,16 +133,16 @@ init(Args) ->
     SPI = spi:open(SPIConfig),
     %% ARR = maps:from_keys(lists:seq(1, StripLen), #{self() => {rgbi,{0,0,0,0}}}),
     ARR = maps:from_keys(lists:seq(1, StripLen), #{}),
-    State =
-        #{led_array => ARR,
-          spi => SPI,
-          strip_len => StripLen,
-          strip_index => StripLen,
-          cbm => CallBackMod,
-          device_name => StripType
-         },
-    erlang:send_after(2000, self(), update_led_strip),
-    {ok, State}.
+        State =
+                #{led_array => ARR,
+                    spi => SPI,
+                    strip_len => StripLen,
+                    strip_index => StripLen,
+                    cbm => CallBackMod,
+                    device_name => StripType,
+                    flush_pending => false
+                 },
+        {ok, State}.
 
 
 %%% gen_server callbacks
@@ -144,8 +156,9 @@ handle_call({set_led, {Index, Colours}}, {Pid, _Tag},
         Index =< Len ->
             link(Pid),
             NewArr = update_array(Index, Arr, Pid, Colours),
-            {reply, ok,
-             State#{led_array := NewArr, strip_index := max(Index, SI)}};
+            NewState0 = State#{led_array := NewArr, strip_index := max(Index, SI)},
+            NewState = maybe_trigger_flush(NewState0),
+            {reply, ok, NewState};
         true ->
             {reply, {error, index_too_large}, State}
     end;
@@ -156,11 +169,16 @@ handle_call({clear_led, Index}, {Pid, _Tag},
         Index =< Len ->
             {NewArr, Removed} = remove_pid_from_array(Index, Pid, Arr),
             maybe_unlink_pid(Removed, Pid, NewArr),
-            {reply, ok,
-             State#{led_array := NewArr, strip_index := max(Index, SI)}};
+            NewState0 = State#{led_array := NewArr, strip_index := max(Index, SI)},
+            NewState = maybe_trigger_flush(NewState0),
+            {reply, ok, NewState};
         true ->
             {reply, {error, index_too_large}, State}
     end;
+handle_call({fill, Colour}, {Pid, _Tag}, State) ->
+    link(Pid),
+    NewState = apply_fill(State, Colour, Pid),
+    {reply, ok, NewState};
 handle_call(_, _, _) ->
     error(not_implemented).
 
@@ -175,8 +193,9 @@ handle_cast({set_led, {Index, Colours}, Pid},
         Index =< Len ->
             link(Pid),
             NewArr = update_array(Index, Arr, Pid, Colours),
-            {noreply,
-             State#{led_array := NewArr, strip_index := max(Index, SI)}};
+            NewState0 = State#{led_array := NewArr, strip_index := max(Index, SI)},
+            NewState = maybe_trigger_flush(NewState0),
+            {noreply, NewState};
         true ->
             {noreply, State}
     end;
@@ -187,11 +206,26 @@ handle_cast({clear_led, Index, Pid},
         Index =< Len ->
             {NewArr, Removed} = remove_pid_from_array(Index, Pid, Arr),
             maybe_unlink_pid(Removed, Pid, NewArr),
-            {noreply,
-             State#{led_array := NewArr, strip_index := max(Index, SI)}};
+            NewState0 = State#{led_array := NewArr, strip_index := max(Index, SI)},
+            NewState = maybe_trigger_flush(NewState0),
+            {noreply, NewState};
         true ->
             {noreply, State}
     end;
+handle_cast({fill, Colour, Pid},
+        State) ->
+    link(Pid),
+    NewState = apply_fill(State, Colour, Pid),
+    {noreply, NewState};
+handle_cast({fill_async, Colour, Pid},
+        #{flush_pending := true} = State) ->
+    unlink(Pid),
+    {noreply, State};
+handle_cast({fill_async, Colour, Pid},
+        State) ->
+    link(Pid),
+    NewState = apply_fill(State, Colour, Pid),
+    {noreply, NewState};
 handle_cast(_, _) ->
   error(not_implemented).
 
@@ -214,7 +248,6 @@ handle_info({'EXIT', Pid, _Reason}, #{led_array := Arr, strip_index := SI} = Sta
     {noreply, State#{led_array := NewArr, strip_index := max(LastIndex, SI)}};
 handle_info(update_led_strip, State) ->
     NewState = update_led_strip(State),
-    erlang:send_after(200, self(), update_led_strip),
     {noreply, NewState}.
 
 -spec terminate(Reason :: (normal | shutdown | {shutdown, term()} |
@@ -231,6 +264,17 @@ update_array(Index, Array, Pid, Value) ->
     Map = maps:get(Index, Array),
     NewMap = Map#{Pid => Value},
     maps:put(Index, NewMap, Array).
+
+apply_fill(#{strip_len := Len} = State, Value, Pid) ->
+    NewArr = fill_array(Len, Pid, Value),
+    NewState0 = State#{led_array := NewArr, strip_index := Len},
+    maybe_trigger_flush(NewState0).
+
+fill_array(Len, Pid, Value) ->
+        lists:foldl(
+            fun(Index, Acc) ->
+                            maps:put(Index, #{Pid => Value}, Acc)
+            end, #{}, lists:seq(1, Len)).
 
 remove_pid_from_array(Index, Pid, Array) ->
     Map = maps:get(Index, Array),
@@ -255,21 +299,27 @@ pid_present(Pid, Array) ->
                       Acc orelse maps:is_key(Pid, Map)
               end, false, Array).
 
+maybe_trigger_flush(State = #{strip_index := SI, flush_pending := false}) when SI > 0 ->
+    erlang:send(self(), update_led_strip),
+    State#{flush_pending := true};
+maybe_trigger_flush(State) ->
+    State.
+
 update_led_strip(#{led_array := Arr, cbm := CBM, spi := SPI,
                    strip_index := SI, device_name := Name} = State)
   when SI > 0 ->
     Dirty = collect_dirty_leds(Arr, SI),
     case Dirty of
         [] ->
-            State#{strip_index := 0};
+            State#{strip_index := 0, flush_pending := false};
         _ ->
             Values = [format_led_value(Name, V) || {_, V} <- lists:sort(Dirty)],
             WriteData = CBM:build_stream(Values),
             ok = spi:write(SPI, Name, #{write_data => WriteData}),
-            State#{strip_index := 0}
+            State#{strip_index := 0, flush_pending := false}
     end;
 update_led_strip(State) ->
-    State.
+    State#{flush_pending := false}.
 
 collect_dirty_leds(Arr, MaxIndex) ->
     maps:fold(fun(Index, Map, Acc) when Index > 0, Index =< MaxIndex ->
