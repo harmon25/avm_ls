@@ -1,0 +1,26 @@
+# Copilot Instructions
+- **Hardware context**: Target is ESP32 running AtomVM; OTP subset only, many Elixir/Erlang modules (e.g. Float, String) missing, so rely on :erlang BIFs and integer math (see AGENTS.md).
+- **Entry point**: lib/avm_ls.ex boots the strip by starting :avm_ls_server with %{di_pin: 32, strip_type: :ws2812, strip_len: 60} then blocks forever; AtomVM's mix atomvm config in mix.exs also points here.
+- **Supervision**: src/avm_ls_sup.erl is a minimal one_for_one supervisor that keeps avm_ls_server (and logger_manager) alive; pass the same start args down when embedding the server elsewhere.
+- **LED server role**: src/avm_ls_server.erl owns SPI state, per-LED maps, and throttled flushing; all API calls (set_led/2, clear_led/1, fill/*) funnel through this gen_server and enforce index bounds and caller linking for cleanup.
+- **Colour model**: colours() accepts rgb/rgbi/rgbw/rgbwi/hsv tuples; sum_led_entries/1 collapses multiple process contributions per LED, clamp_components/1 caps ranges (RGB<=255, I<=100) before encoding.
+- **Dirty tracking**: maybe_trigger_flush/1 sets flush_pending and sends update_led_strip; collect_dirty_leds only visits indices <= strip_index, so keep strip_index accurate whenever you touch the map.
+- **SPI writes**: update_led_strip builds ordered frames via format_led_value + callback build_stream/1 and calls spi:write/3; long writes (>~10 ms) trip the AtomVM watchdog, so avoid tight update loops without sleeps.
+- **fill vs fill_async**: fill/1 is a gen_server:call that blocks until SPI flush completes; fill_async/1 uses cast but is dropped while flush_pending=true, so debounce callers or they will spin without effect.
+- **Per-process ownership**: set_led/2 and clear_led/1 link/unlink the caller; when a process dies, handle_info({'EXIT', ...}) removes its contributions automatically—reuse those APIs instead of mutating led_array manually.
+- **Strip abstraction**: src/avm_ls_strip.erl defines the behaviour; new strip modules live beside avm_ls_ws2812.erl, avm_ls_ap102.erl, avm_ls_sk9822.erl, avm_ls_sk6812.erl and must implement spi_config/1 and build_stream/1 formatting that matches the hardware.
+- **WS2812 specifics**: avm_ls_ws2812.erl maps RGB to GRB order, expands bits to 3-bit symbols, and scales brightness using normalize_brightness; when porting, keep the integer-only math for AtomVM compatibility.
+- **APA102/SK9822 specifics**: avm_ls_ap102.erl handles both clock/data pins, prepends start/end frames, and quantizes illumination to 5 bits; reuse the OrderFun callback when targeting other SPI strips that reorder channels.
+- **Phase/gamma guidance**: AGENTS.md documents breath-effect lessons—prefer absolute phase advance_phase/3, gamma lookup tables with interpolation, and low-pass filtering (@lowpass_alpha) to hide scheduler jitter.
+- **Throttle brightness changes**: Respect @min_brightness_step and only log via log_instrument/2 when @instrument? is true; timestamps should use :erlang.monotonic_time(:microsecond) for consistent profiling.
+- **Mailbox hygiene**: fill_async/1 spam can flood the server; AGENTS.md recommends keeping update cadence low or adding throttle logic before casting.
+- **Watchdog avoidance**: collect_dirty_leds + spi:write can exceed deadlines if run on a periodic timer; current design prefers event-driven flush_pending flags—stick with that unless you implement yielding timers.
+- **Randomness**: avm_ls_server:random/0 delegates to atomvm:random; AtomVM may seed differently, so seed your own processes if determinism matters.
+- **Building**: Use mix deps.get && mix deps.compile; package with MIX_ENV=prod mix atomvm.packbeam so only release beams land in avm_ls.avm.
+- **Flashing**: mix atomvm.esp32.flash --port /dev/tty.usbserial-XXXXX writes the image defined in manifest.toml; alternatively copy avm_ls.avm to <platform_root> and run ./build/flash.sh followed by idf.py monitor.
+- **Runtime reset**: After flashing, the program auto-starts; to rerun without reflashing, connect via idf.py monitor from the AtomVM platform root.
+- **Docs**: mix docs generates combined Elixir/Erlang HTML docs (via ex_doc); Gleam docs require gleam docs build and currently emit into build/.
+- **Dependencies**: mix.exs pins ExAtomVM from Git and expects Gleam toolchain installed via mix_gleam (see README.md “Prerequisites”).
+- **Testing strategy**: No traditional test suite exists; validation usually means flashing hardware and watching the strip plus serial logs, so keep instrumentation hooks lightweight and guard them with configuration flags.
+- **Coding style**: Stick to integer math, avoid Float/String modules unavailable on AtomVM, and keep comments succinct but clarify complex math blocks, matching existing src/*.erl conventions.
+- **When in doubt**: Check AGENTS.md for real-world timing data (e.g., 60 WS2812 LEDs take ~1–2 ms per SPI frame) before changing flush cadence or buffer sizes.
